@@ -217,15 +217,100 @@ quarantine.write.mode("overwrite").saveAsTable("silver.transaction_hi_small_quar
 
 # COMMAND ----------
 
-
+# DBTITLE 1,accounts
 s = spark.table("silver.transaction_hi_small")
 
-def account_key(bank, acct):
-    return F.xxhash64(F.col(bank), F.col(acct))
 
-# --- dim_account: every account seen on either side of a transaction
+def account_key(bank, acct):
+    return F.substring(F.sha2(F.concat_ws(" ", bank, acct), 256), 0, 16)
+
+
 accounts = (
-    s.select(F.col("from_bank_id").alias("bank_id"), F.col("from_account").alias("account_number"))
-    .union(s.select(F.col("to_bank_id").alias("bank_id"), F.col("to_account").alias("account_number")))
+    s.select(
+        F.col("from_bank_id").alias("bank_id"),
+        F.col("from_account").alias("account_number"),
+    )
+    .union(
+        s.select(
+            F.col("to_bank_id").alias("bank_id"),
+            F.col("to_account").alias("account_number"),
+        )
+    )
     .distinct()
 )
+
+# COMMAND ----------
+
+accounts = accounts.withColumn("account_key", account_key("bank_id", "account_number"))
+accounts.display()
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Extract Unique Bank IDs with Hashed Keys
+banks = (
+    s.select(F.col("from_bank_id").alias("bank_id"))
+    .union(s.select(F.col("to_bank_id")))
+    .distinct()
+)
+banks = banks.select(
+    F.substring(F.sha2(F.col("bank_id"), 256), 0, 16).alias("bank_key"),
+    F.col("bank_id"),
+)
+banks.display()
+
+# COMMAND ----------
+
+# DBTITLE 1,generate date dimension with weekday and weekend flags
+bounds = s.agg(F.min("txn_date").alias("lo"), F.max("txn_date").alias("hi"))
+
+dates = (
+    bounds.select(F.explode(F.sequence("lo", "hi")).alias("date"))
+    .select(
+        F.date_format("date", "yyyyMMdd").cast("int").alias("date_key"),
+        "date",
+        F.dayofweek("date").alias("day_of_week"),        # 1 = Sunday
+        F.date_format("date", "E").alias("day_name"),
+        F.weekofyear("date").alias("iso_week"),
+        F.month("date").alias("month"),
+        F.year("date").alias("year"),
+        F.dayofweek("date").isin(1, 7).alias("is_weekend"),
+    )
+)
+
+dates.display()
+
+# COMMAND ----------
+
+s.display()
+
+# COMMAND ----------
+
+fact = s.select(
+    "txn_id",
+    F.date_format("txn_date", "yyyyMMdd").cast("int").alias("date_key"),
+    "txn_ts",
+    "txn_date",
+    account_key("from_bank_id", "from_account").alias("from_account_key"),
+    account_key("to_bank_id", "to_account").alias("to_account_key"),
+    F.substring(F.sha2(F.col("from_bank_id"), 256), 0, 16).alias("from_bank_key"),
+    F.substring(F.sha2(F.col("to_bank_id"), 256), 0, 16).alias("to_bank_key"),
+    "amount_paid",
+    "payment_currency",
+    "amount_received",
+    "receiving_currency",
+    "payment_format",
+    "is_laundering",
+    "is_self_loop",
+)
+
+fact.display()
+
+# COMMAND ----------
+
+spark.sql("CREATE SCHEMA IF NOT EXISTS gold")
+
+accounts.write.mode("overwrite").saveAsTable("gold.dim_account")
+banks.write.mode("overwrite").saveAsTable("gold.dim_bank")
+dates.write.mode("overwrite").saveAsTable("gold.dim_date")
+fact.write.mode("overwrite").saveAsTable("gold.fact_transaction_hi_small")
