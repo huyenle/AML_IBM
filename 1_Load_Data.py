@@ -7,6 +7,10 @@ from pyspark.sql import functions as F
 
 # COMMAND ----------
 
+!pip install databricks-labs-dqx==0.8.0
+
+# COMMAND ----------
+
 dbutils.fs.ls("/")
 
 # COMMAND ----------
@@ -122,7 +126,107 @@ casted_b = b.select(
 
 # COMMAND ----------
 
-casted_b.columns
+# casted_b.select([F.sum(F.col(c).isNull().cast("int")).alias(c) for c in casted_b.columns]).display()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Define validation rules
+
+# COMMAND ----------
+
+PAYMENT_FORMATS = ["ACH", "Bitcoin", "Cash", "Cheque", "Credit Card", "Reinvestment", "Wire"]
+KNOWN_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CAD", "CHF", "AUD", "NZD", "SEK", "DKK", "NOK", "CNY", "HKD", "SGD", "MXN", "BRL", "INR", "PLN", "RUB", "TRY", "ZAR", "KRW", "THB", "IDR", "PHP", "MYR", "TWD", "CZK", "HUF", "PLN", "ISK", "RON", "HRK", "BGN", "CZK", "DKK", "HUF", "ISK", "NOK", "PLN", "RON", "SEK", "TRY", "ZAR"]
+NON_NULL_COLS = [
+    "txn_ts",
+    "from_bank_id",
+    "from_account",
+    "to_bank_id",
+    "to_account",
+    "amount_paid",
+    "payment_currency",
+    "amount_received",
+    "receiving_currency"]
+
+
+# COMMAND ----------
+
+# define dictionary for DQX
+def err(name, function, **arguments):
+    return {
+        "name": name,
+        "criticality": "error",
+        "check": {"function": function, "arguments": arguments},
+    }
+
+
+def warn(name, function, **arguments):
+    return {
+        "name": name,
+        "criticality": "warn",
+        "check": {"function": function, "arguments": arguments},
+    }
+
+# COMMAND ----------
+
+# DBTITLE 1,list DQ rules
+DQ_Checks = [
+    *[err(name=f"{c}_not_null", function="is_not_null") for c in NON_NULL_COLS],
+    err(
+        name="non negative amount receved",
+        function="is_positive",
+        column="amount_received",
+    ),
+    err(name="non negative amount paid", function="is_positive", column="amount_paid"),
+    err(
+        name="valid laundering flag",
+        function="is_in",
+        column="is_laundering",
+        values=[0, 1],
+    ),
+    warn(
+        name="if_same_currentcy_then_same_amount",
+        function="sql_expression",
+        expression="payment_currency <> receiving_currency OR amount_paid == amount_received",
+        msg = "same currency but the amounts differ"
+    ),
+    warn(
+        name="valid payment format",
+        function="is_in",
+        column="payment_format",
+        values=PAYMENT_FORMATS,
+    ),
+    warn(
+        name="new payment currency",
+        function="is_in",
+        column="payment_currency",
+        values=KNOWN_CURRENCIES,
+        msg = "new currency"
+    ),
+    warn(
+        name="new receiving currency",
+        function="is_in",
+        column="receiving_currency",
+        values=KNOWN_CURRENCIES,
+        msg = "new currency"
+    )
+]
+
+# COMMAND ----------
+
+from databricks.labs.dqx.engine import DQEngine
+from databricks.sdk import WorkspaceClient
+
+dq = DQEngine(WorkspaceClient())
+checked = dq.run_checks(
+    casted_b,
+    DQ_Checks,
+    "silver",
+    quarantine="quarantine",
+    quarantine_schema="default",
+    quarantine_table="quarantine",
+)
+checked.display()
 
 # COMMAND ----------
 
@@ -282,10 +386,6 @@ dates.display()
 
 # COMMAND ----------
 
-s.display()
-
-# COMMAND ----------
-
 fact = s.select(
     "txn_id",
     F.date_format("txn_date", "yyyyMMdd").cast("int").alias("date_key"),
@@ -308,9 +408,59 @@ fact.display()
 
 # COMMAND ----------
 
+# DBTITLE 1,write data
 spark.sql("CREATE SCHEMA IF NOT EXISTS gold")
 
-accounts.write.mode("overwrite").saveAsTable("gold.dim_account")
-banks.write.mode("overwrite").saveAsTable("gold.dim_bank")
-dates.write.mode("overwrite").saveAsTable("gold.dim_date")
-fact.write.mode("overwrite").saveAsTable("gold.fact_transaction_hi_small")
+accounts.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("gold.dim_account")
+banks.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("gold.dim_bank")
+dates.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("gold.dim_date")
+fact.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("gold.fact_transaction_hi_small")
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Check count
+
+# COMMAND ----------
+
+n_bronze = spark.table("bronze.transaction_hi_small").count()
+n_silver = spark.table("silver.transaction_hi_small").count()
+n_quar = spark.table("silver.transaction_hi_small_quarantine").count()
+f = spark.table("gold.fact_transaction_hi_small")
+n_fact = f.count()
+
+# COMMAND ----------
+
+checks = {
+    "bronze = silver + quarantine": n_bronze == n_silver + n_quar,
+    "fact = silver": n_fact == n_silver,
+    "txn_id unique": f.select("txn_id").distinct().count() == n_fact,
+    "no orphan sender accounts": f.join(
+        spark.table("gold.dim_account"),
+        f.from_account_key == F.col("account_key"),
+        "left_anti",
+    ).count()
+    == 0,
+    "no orphan receiver accounts": f.join(
+        spark.table("gold.dim_account"),
+        f.to_account_key == F.col("account_key"),
+        "left_anti",
+    ).count()
+    == 0,
+    "no orphan dates": f.join(
+        spark.table("gold.dim_date"), "date_key", "left_anti"
+    ).count()
+    == 0,
+    "laundering count preserved": (
+        spark.table("silver.transaction_hi_small").filter("is_laundering = 1").count()
+        == f.filter("is_laundering = 1").count()
+    ),
+}
+
+# COMMAND ----------
+
+print(f"bronze {n_bronze:,} | silver {n_silver:,} | quarantine {n_quar:,} | fact {n_fact:,}")
+for name, ok in checks.items():
+    print(("PASS " if ok else "FAIL ") + name)
+assert all(checks.values()), "Reconciliation failed"

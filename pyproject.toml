@@ -1,0 +1,9 @@
+[project]
+name = "aml-ibm"
+version = "0.1.0"
+dependencies = [
+    "databricks-labs-dqx>=0.12",
+]
+
+[tool.databricks.environment]
+environment_version = "6"
