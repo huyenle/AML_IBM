@@ -7,10 +7,6 @@ from pyspark.sql import functions as F
 
 # COMMAND ----------
 
-!pip install databricks-labs-dqx==0.8.0
-
-# COMMAND ----------
-
 dbutils.fs.ls("/")
 
 # COMMAND ----------
@@ -136,7 +132,7 @@ casted_b = b.select(
 # COMMAND ----------
 
 PAYMENT_FORMATS = ["ACH", "Bitcoin", "Cash", "Cheque", "Credit Card", "Reinvestment", "Wire"]
-KNOWN_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CAD", "CHF", "AUD", "NZD", "SEK", "DKK", "NOK", "CNY", "HKD", "SGD", "MXN", "BRL", "INR", "PLN", "RUB", "TRY", "ZAR", "KRW", "THB", "IDR", "PHP", "MYR", "TWD", "CZK", "HUF", "PLN", "ISK", "RON", "HRK", "BGN", "CZK", "DKK", "HUF", "ISK", "NOK", "PLN", "RON", "SEK", "TRY", "ZAR"]
+KNOWN_CURRENCIES = ["US Dollar", "Euro", "Yen", "Mexican Peso", "Yuan", "Canadian Dollar", "Bitcoin", "Australian Dollar", "Saudi Riyal", "UK Pound", "Shekel", "Swiss Franc", "Brazil Real", "Ruble", "Rupee"]
 NON_NULL_COLS = [
     "txn_ts",
     "from_bank_id",
@@ -171,74 +167,71 @@ def warn(name, function, **arguments):
 
 # DBTITLE 1,list DQ rules
 DQ_Checks = [
-    *[err(name=f"{c}_not_null", function="is_not_null") for c in NON_NULL_COLS],
+    *[
+        err(name=f"{c}_not_null", function="is_not_null", column=c)
+        for c in NON_NULL_COLS
+    ],
     err(
         name="non negative amount receved",
-        function="is_positive",
+        function="is_not_less_than",
+        limit=0,
         column="amount_received",
     ),
-    err(name="non negative amount paid", function="is_positive", column="amount_paid"),
+    err(
+        name="non negative amount paid",
+        function="is_not_less_than",
+        limit=0,
+        column="amount_paid",
+    ),
     err(
         name="valid laundering flag",
-        function="is_in",
+        function="is_in_list",
         column="is_laundering",
-        values=[0, 1],
+        allowed=[0, 1],
     ),
     warn(
         name="if_same_currentcy_then_same_amount",
         function="sql_expression",
         expression="payment_currency <> receiving_currency OR amount_paid == amount_received",
-        msg = "same currency but the amounts differ"
+        msg="same currency but the amounts differ",
     ),
     warn(
         name="valid payment format",
-        function="is_in",
+        function="is_in_list",
         column="payment_format",
-        values=PAYMENT_FORMATS,
+        allowed=[F.lit(p) for p in PAYMENT_FORMATS],
     ),
     warn(
         name="new payment currency",
-        function="is_in",
+        function="is_in_list",
         column="payment_currency",
-        values=KNOWN_CURRENCIES,
-        msg = "new currency"
+        allowed=[F.lit(c) for c in KNOWN_CURRENCIES],
     ),
     warn(
         name="new receiving currency",
-        function="is_in",
+        function="is_in_list",
         column="receiving_currency",
-        values=KNOWN_CURRENCIES,
-        msg = "new currency"
-    )
+        allowed=[F.lit(c) for c in KNOWN_CURRENCIES],
+    ),
 ]
 
 # COMMAND ----------
 
 from databricks.labs.dqx.engine import DQEngine
 from databricks.sdk import WorkspaceClient
-
 dq = DQEngine(WorkspaceClient())
-checked = dq.run_checks(
-    casted_b,
-    DQ_Checks,
-    "silver",
-    quarantine="quarantine",
-    quarantine_schema="default",
-    quarantine_table="quarantine",
-)
-checked.display()
+checked = dq.apply_checks_by_metadata(casted_b, DQ_Checks)
+
 
 # COMMAND ----------
 
-is_valid = (
-    F.col("txn_ts").isNotNull()
-    & F.col("from_account").isNotNull() & F.col("to_account").isNotNull()
-    & F.col("amount_paid").isNotNull() & (F.col("amount_paid") >= 0)
-    & F.col("amount_received").isNotNull() & (F.col("amount_received") >= 0)
-    & F.col("is_laundering").isin(0, 1)
-)
-valid_b = casted_b.filter(is_valid)
-quarantine = casted_b.filter(~is_valid|is_valid.isNull())
+ERR, WARN = "_errors", "_warnings"   # DQX's default result columns
+assert ERR in checked.columns and WARN in checked.columns, f"DQX result columns changed: {checked.columns}"
+
+# COMMAND ----------
+
+valid = checked.filter(F.col(ERR).isNull())
+quarantine = checked.filter(F.col(ERR).isNotNull()) 
 
 # COMMAND ----------
 
@@ -247,7 +240,7 @@ quarantine.display()
 # COMMAND ----------
 
 # DBTITLE 1,save table
-valid_b.display()
+valid.display()
 
 # COMMAND ----------
 
@@ -277,7 +270,7 @@ row_hash = F.sha2(
 )
 w = Window.partitionBy("row_hash").orderBy(F.lit("row_hash"))
 silver = (
-    valid_b.withColumn("row_hash", row_hash)
+    valid.withColumn("row_hash", row_hash)
     .withColumn("dup_seq", F.row_number().over(w))
     .withColumn(
         "txn_id", F.concat_ws("-", F.substring("row_hash", 1, 16), F.col("dup_seq"))
@@ -303,8 +296,8 @@ silver.filter(
 # COMMAND ----------
 
 spark.sql("CREATE SCHEMA IF NOT EXISTS silver")
-silver.write.mode("overwrite").saveAsTable("silver.transaction_hi_small")
-quarantine.write.mode("overwrite").saveAsTable("silver.transaction_hi_small_quarantine")
+silver.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("silver.transaction_hi_small")
+quarantine.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("silver.transaction_hi_small_quarantine")
 
 # COMMAND ----------
 
