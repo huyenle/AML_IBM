@@ -1,0 +1,28 @@
+bundle:
+  name: aml-ibm
+
+targets:
+  dev:
+    default: true
+    workspace:
+      host: https://<your-workspace>.cloud.databricks.com
+
+resources:
+  jobs:
+    pytest:
+      name: aml-ibm-pytest
+      tasks:
+        - task_key: pytest
+          spark_python_task:
+            python_file: ../tests/run_on_databricks.py
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: Standard_DS3_v2
+            num_workers: 0        
+            spark_conf:
+              spark.master: local[*]
+          libraries:
+            - pypi:
+                package: pytest
+            # - pypi:
+            #     package: databricks-labs-dqx>=0.12

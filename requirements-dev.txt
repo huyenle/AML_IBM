@@ -1,0 +1,5 @@
+# Test-only dependencies. Kept OUT of pyproject.toml on purpose: that file drives
+# the Databricks serverless environment, and installing PySpark there breaks the
+# session. Install locally / in CI with:  pip install -r requirements-dev.txt
+pyspark>=3.5
+pytest>=8.0
