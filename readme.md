@@ -12,32 +12,13 @@ bronze (raw CSV)  →  silver (typed, DQX-checked)  →  gold (star schema)  →
 | `notebooks/` | Databricks notebooks: read tables, call functions, write tables. **No business logic.** |
 | `aml/` | The logic: data preparation (`transforms.py`) and detection rules (`rules.py`). Pure functions. |
 | `tests/` | Unit tests for everything in `aml/`. |
-| `.github/workflows/ci.yml`, `azure-pipelines.yml` | CI: runs the tests on every push. |
+| `.github/workflows/ci.yml`, `azure-pipelines.yml` | CI: runs the tests on every push. (NOT YET DONE) |
 
 ---
 
-# How we test PySpark code
+# How to test PySpark code
 
-This part is for anyone joining the project. It explains how the tests work and how to write new ones.
-If you only read one section, read **"Adding a new rule"**.
-
-## 1. The one idea that makes testing possible
-
-**Logic goes in functions in `src/`, not in notebooks.**
-
-A test can import `src/rules.py`; it cannot import a notebook. So notebooks only do input and output:
-
-```python
-fact = spark.table("fact_transaction")      # notebook: read
-alerts = build_alerts(tx, RULES)            # aml/: logic  ← this is what we test
-alerts.write.saveAsTable("stg_alert")       # notebook: write
-```
-
-Every function in `aml/` takes DataFrames as arguments and returns a DataFrame. It never reads or writes
-a table itself. That way a test can hand it five made-up rows and check the answer. This is also what
-Databricks recommends: keep functions and their unit tests outside notebooks.
-
-## 2. Running the tests
+## 1. Running the tests
 
 On your laptop (needs Python 3.10+ and Java 17, because Spark runs on the JVM):
 
@@ -57,7 +38,7 @@ pytest -x                               # stop at the first failure
 > ⚠️ **Never add `pyspark` to `pyproject.toml`.** That file drives the Databricks environment, and installing
 > PySpark on Databricks serverless breaks the session. Test-only packages go in `requirements-dev.txt`.
 
-### 2b. Running the tests on a Databricks cluster (CLI)
+## 2. Running the tests on a Databricks cluster (CLI)
 
 >  **TODO — not tested yet.**  Run the suite on real Databricks compute with the `databricks` CLI. It deploys the
 `databricks.yml` asset bundle (which runs `tests/run_on_databricks.py` on the cluster):
